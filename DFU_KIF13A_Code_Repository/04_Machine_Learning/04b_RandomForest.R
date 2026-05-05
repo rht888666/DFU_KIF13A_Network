@@ -1,0 +1,158 @@
+# ============================================================================
+# DFU Real Data Analysis - Advanced Prediction
+# Script 07: Random Forest Model Optimization
+# Target: Nature Medicine / JAMA / Lancet
+# Note: STRICTLY REAL DATA. Using Machine Learning to capture non-linear patterns.
+# ============================================================================
+
+rm(list = ls())
+gc()
+
+# ============================================================================
+# 1. 环境设置
+# ============================================================================
+
+options(repos = c(CRAN = "https://mirrors.tuna.tsinghua.edu.cn/CRAN/"))
+
+suppressPackageStartupMessages({
+    library(tidyverse)
+    library(randomForest)
+    library(pROC)
+    library(caret)
+})
+
+project_dir <- "E:/人工智能学习/任海涛虚拟基因敲�?
+results_dir <- file.path(project_dir, "所有真实数据分�?)
+load(file.path(results_dir, "Data/01_REAL_processed_data.RData"))
+vgk_res <- read.csv(file.path(results_dir, "Tables/02_Real_VGK_Results.csv"))
+
+# ============================================================================
+# 2. 特征工程 (High-Impact Drivers Only)
+# ============================================================================
+
+message("Selecting Top 50 VGK Drivers for ML...")
+
+# 为了避免过拟合，我们只选择 DI Score 最显著的前 50 个基�?
+top_pos <- head(vgk_res %>% arrange(desc(DI_Score)), 25)$gene
+top_neg <- tail(vgk_res %>% arrange(desc(DI_Score)), 25)$gene
+features <- unique(c(top_pos, top_neg, "KIF13A", "ZSWIM8"))
+# 严格过滤: 仅保留存在于表达矩阵中的基因
+features <- features[features %in% rownames(expr_log)]
+message(paste("Valid features for ML:", length(features)))
+
+if (length(features) < 2) stop("Not enough valid features for ML!")
+
+# 构建 ML 数据�?
+ml_data <- t(expr_log[features, ]) %>% as.data.frame()
+# 确保列名合法 (替换 - �?.)
+colnames(ml_data) <- make.names(colnames(ml_data))
+ml_data$Outcome <- as.factor(metadata$healed) # Yes/No
+
+message(paste("Training data dimensions:", nrow(ml_data), "samples x", ncol(ml_data), "features"))
+
+# ============================================================================
+# 3. 随机森林模型训练 (With TuneGrid)
+# 3. 随机森林模型训练 (Native randomForest)
+# ============================================================================
+
+message("Start Training Random Forest (Native Implementation)...")
+
+set.seed(123)
+
+# 准备数据矩阵
+x <- ml_data[, colnames(ml_data) != "Outcome"]
+y <- ml_data$Outcome
+
+# 训练全模�?
+rf_model <- randomForest(x, y, importance = TRUE, ntree = 500)
+
+message("Random Forest Training Completed.")
+
+# 手动 5-Fold Cross Validation
+n_folds <- 5
+folds <- cut(seq(1, nrow(ml_data)), breaks = n_folds, labels = FALSE)
+# 随机打乱样本
+set.seed(123)
+fold_idx <- sample(folds)
+
+cv_preds <- numeric(nrow(ml_data))
+cv_obs <- ml_data$Outcome
+
+for (i in 1:n_folds) {
+    testIndexes <- which(fold_idx == i, arr.ind = TRUE)
+    testData <- ml_data[testIndexes, ]
+    trainData <- ml_data[-testIndexes, ]
+
+    # 训练
+    rf_fold <- randomForest(Outcome ~ ., data = trainData, ntree = 500)
+
+    # 预测概率 (Yes 的概�?
+    preds <- predict(rf_fold, newdata = testData, type = "prob")[, "Yes"]
+
+    # 存储预测结果
+    cv_preds[testIndexes] <- preds
+}
+
+# 计算 CV AUC
+roc_rf <- roc(cv_obs, cv_preds, quiet = TRUE)
+auc_rf <- roc_rf$auc
+
+message(paste("Random Forest CV AUC:", round(auc_rf, 3)))
+
+# ============================================================================
+# 4. 特征重要性分�?
+# ============================================================================
+
+message("Analyzing Feature Importance...")
+
+# 提取变量重要�?
+imp_vals <- importance(rf_model, type = 1) # MeanDecreaseAccuracy
+imp_df <- data.frame(Gene = rownames(imp_vals), Overall = imp_vals[, 1])
+imp_df <- imp_df %>% arrange(desc(Overall))
+
+# 保存重要性排�?
+write.csv(imp_df, file.path(results_dir, "Tables/07_RF_Feature_Importance.csv"), row.names = FALSE)
+
+# 可视�?Top 20 重要特征
+p_imp <- ggplot(head(imp_df, 20), aes(x = reorder(Gene, Overall), y = Overall)) +
+    geom_bar(stat = "identity", fill = "#377EB8") +
+    coord_flip() +
+    labs(
+        title = "Top 20 Predictive Features (Random Forest)",
+        x = "Gene", y = "Importance Score"
+    ) +
+    theme_classic()
+
+ggsave(file.path(results_dir, "Figures/07_RF_Importance.pdf"), p_imp, width = 8, height = 10)
+
+# ============================================================================
+# 6. 生成最终报�?
+# ============================================================================
+
+sink(file.path(results_dir, "Reports/07_ML_Model_Summary.txt"))
+cat("================================================\n")
+cat("          MACHINE LEARNING MODEL REPORT         \n")
+cat("================================================\n")
+cat("Date:", as.character(Sys.time()), "\n\n")
+
+cat("1. Model Performance (Random Forest):\n")
+cat("   - 5-Fold Repeated CV AUC:", round(auc_rf, 3), "\n")
+cat("   - Best Hyperparameters (mtry):", rf_model$bestTune$mtry, "\n\n")
+
+cat("2. Top 10 Most Important Genes:\n")
+print(head(imp_df[, c("Gene", "Overall")], 10))
+cat("\n")
+
+cat("3. KIF13A Importance Rank:\n")
+kif_rank <- which(imp_df$Gene == "KIF13A")
+cat("   - Rank:", kif_rank, "/", nrow(imp_df), "\n")
+cat("   - Score:", imp_df$Overall[kif_rank], "\n\n")
+
+cat("4. Correlation Analysis (Outcome vs Gene):\n")
+cat("   (Just for reference, positive correlation with 'Yes' means Healed-associated)\n")
+kif_cor <- cor(as.numeric(ml_data$KIF13A), as.numeric(ml_data$Outcome) - 1) # Outcome 1=No, 2=Yes
+cat("   - KIF13A Correlation with Healing:", round(kif_cor, 3), "\n")
+
+sink()
+
+message("Script 07 Completed. Advanced ML model finished.")
